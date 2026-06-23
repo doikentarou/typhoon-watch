@@ -1,0 +1,37 @@
+name: collect-typhoon
+
+# 気象庁の台風予報を30分ごとに取得して data/ へ蓄積する。
+# あなたのPCは不要 — GitHubのサーバー上で動く。
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # 30分ごと(UTC基準・高負荷時は数分前後する)
+  workflow_dispatch:          # 手動実行ボタン
+
+permissions:
+  contents: write
+
+concurrency:
+  group: collect-typhoon
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Collect typhoon snapshots
+        run: node collect.mjs
+      - name: Commit & push if changed
+        run: |
+          git config user.name "typhoon-collector[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then
+            echo "変更なし"
+          else
+            git commit -m "collect: $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push
+          fi
