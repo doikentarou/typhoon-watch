@@ -62,13 +62,18 @@
       <div class="legend">
         <div><i style="background:#ff5a5a"></i>暴風警戒域　<i style="background:#ffd24a"></i>強風域</div>
         <div><i style="background:#ffffff;border:1px solid #888"></i>予報円　<i style="background:#3fa9f5"></i>1時間毎の予想位置</div>
-        <div><span style="color:#9fb3c8">実線=実況進路 / 破線=予想進路</span></div>
+        <div><span style="color:#ff5a5a">━ 最新の予想進路</span>　<span style="color:#19c2c2">┄ 過去の予想進路</span></div>
+        <div><span style="color:#ffd24a">┄ 同時刻での予報差（旧→新の前倒し/後ろ倒し）</span></div>
       </div>
     </div>
     <div id="side">
       <div class="card" id="cmpCard">
-        <h2>3時間前の予報との比較（加速 / 減速）</h2>
-        <div id="cmpBody" class="muted">履歴を蓄積中… 画面を開いたまま自動更新が数回走ると比較できます。</div>
+        <h2>過去の予報と地図で比較（加速 / 減速）</h2>
+        <div class="ctrl" style="margin-bottom:8px">
+          <span style="white-space:nowrap">地図に重ねる過去予報:</span>
+          <select id="cmpSelect" style="flex:1;min-width:0"></select>
+        </div>
+        <div id="cmpBody" class="muted">履歴を蓄積中… クラウド収集が貯まると過去予報を選べます。</div>
       </div>
       <div class="card" id="intCard">
         <h2>強度（中心気圧・最大風速）</h2>
@@ -278,8 +283,38 @@ function render(fc){
     if(tip) m.bindTooltip(tip,{direction:"top",offset:[0,-6]});
   });
 
+  // ===== 過去予報のオーバーレイ比較 =====
+  let boundsPts=pts.map(p=>p.c);
+  if(window.__cmp && fc.analysis){
+    const old=window.__cmp.old, op=officialPoints(old);
+    if(op.length){
+      // 旧予想進路（シアン破線）
+      L.polyline(op.map(p=>p.c),{color:"#19c2c2",weight:2.5,dashArray:"2,7",opacity:.9}).addTo(layer);
+      // 旧予報の各点
+      op.forEach(p=>{
+        if(p.h===0) return;
+        L.circleMarker(p.c,{radius:4,color:"#063b3b",weight:1,fillColor:"#19c2c2",fillOpacity:.95})
+          .bindTooltip(`旧予報 +${p.h}h<br>${fmtJST(p.t)} の予想`,{direction:"top"}).addTo(layer);
+      });
+      // 同じ時刻における 旧予報→新予報 の差（黄破線）。＝予報の前倒し/後ろ倒し
+      const oldEnd=op[op.length-1].t.getTime();
+      pts.forEach(n=>{
+        if(n.h===0) return;
+        if(n.t.getTime()>oldEnd) return;            // 旧予報の範囲内のみ
+        const oldAt=positionAt(op, n.t);
+        L.polyline([oldAt, n.c],{color:"#ffd24a",weight:1.6,opacity:.85,dashArray:"1,4"}).addTo(layer);
+      });
+      // 旧予報が「現在時刻」に予想していた位置 → 実際の現在位置（最重要の差）
+      const predNow=positionAt(op, fc.analysis.t);
+      L.circleMarker(predNow,{radius:7,color:"#19c2c2",weight:2,fillColor:"#19c2c2",fillOpacity:.35})
+        .bindTooltip("旧予報が予想していた“現在位置”",{direction:"top"}).addTo(layer);
+      L.polyline([predNow, fc.analysis.center],{color:"#ff5a5a",weight:3,opacity:.95}).addTo(layer);
+      boundsPts=boundsPts.concat(op.map(p=>p.c), [predNow]);
+    }
+  }
+
   // 表示範囲
-  try{ const b=L.latLngBounds(pts.map(p=>p.c)); map.fitBounds(b.pad(0.3)); }catch(e){}
+  try{ const b=L.latLngBounds(boundsPts); map.fitBounds(b.pad(0.25)); }catch(e){}
 }
 
 // ---------- 速度表 ----------
@@ -342,29 +377,17 @@ function intensity(fc){
 // ---------- 3時間前との比較 ----------
 function compare(num, current){
   const body=document.getElementById("cmpBody");
-  // localStorage(開いている間に蓄積) と ディスク(クラウド収集) を統合
-  const local=loadSnaps(num).map(s=>({issue:s.issue,data:s.data}));
-  const disk=(diskSnaps[num]||[]);
-  const map=new Map();
-  [...disk,...local].forEach(s=>{ try{ map.set(new Date(s.issue).toISOString(), s); }catch(e){} });
-  const curIso=current.issue?new Date(current.issue).toISOString():null;
-  const snaps=[...map.values()].filter(s=>{ try{return new Date(s.issue).toISOString()!==curIso;}catch(e){return true;} })
-    .sort((a,b)=>new Date(a.issue)-new Date(b.issue));
-  if(!snaps.length){ body.innerHTML='<span class="muted">過去スナップショットがまだありません。クラウド収集(GitHub Actions)が稼働していれば数十分で蓄積されます。ローカル単体運用では、画面を開いたまま約3時間後から比較が有効になります。</span>'; return; }
-  // now(=現在の実況時刻)に最も近い「約3時間前発表」を選ぶ
-  const nowMs=current.analysis?current.analysis.t.getTime():Date.now();
-  let best=null;
-  for(const s of snaps){
-    const ageH=(nowMs-new Date(s.issue).getTime())/3600000;
-    if(ageH<CMP_MIN_H||ageH>CMP_MAX_H+3) continue;
-    const score=Math.abs(ageH-CMP_TARGET_H);
-    if(!best||score<best.score) best={s,ageH,score};
+  const snaps=window.__snaps||[];
+  if(!window.__cmp){
+    body.innerHTML = (cmpChoice==="off")
+      ? '<span class="muted">「重ねない」を選択中です。上のメニューで過去予報を選ぶと地図に重ねて比較します。</span>'
+      : (snaps.length? '<span class="muted">比較対象を選べません。上のメニューから過去予報を選んでください。</span>'
+        : '<span class="muted">過去スナップショットがまだありません。クラウド収集(GitHub Actions)が稼働していれば数十分で蓄積されます。ローカル単体運用では、画面を開いたまま約3時間後から比較が有効になります。</span>');
+    return;
   }
-  if(!best){
-    // 範囲内が無ければ一番古いものを使う
-    const s=snaps[0]; best={s, ageH:(nowMs-new Date(s.issue).getTime())/3600000, score:99};
-  }
-  const old=parseForecast(best.s.data);
+  const info=window.__cmp.info;
+  const best={ s:info.snap, ageH:info.ageH };
+  const old=window.__cmp.old;
   const oldPts=officialPoints(old);
   if(!oldPts.length||!current.analysis){ body.innerHTML='<span class="muted">比較データが不足しています。</span>'; return; }
 
@@ -403,7 +426,7 @@ function compare(num, current){
 }
 
 // ---------- 取得フロー ----------
-let currentNum=null, timer=null, diskSnaps={};
+let currentNum=null, timer=null, diskSnaps={}, cmpChoice="auto";
 async function fetchJSON(url){ const r=await fetch(url+(url.includes("?")?"&":"?")+"_="+Date.now()); if(!r.ok) throw new Error(r.status+" "+url); return r.json(); }
 
 // クラウド収集(data/)に蓄積されたスナップショットを読む。無ければ静かに無視。
@@ -414,6 +437,58 @@ async function loadDiskSnaps(tc){
     const arr=await Promise.all(files.map(f=>fetchJSON(`data/${tc}/${f}`).catch(()=>null)));
     diskSnaps[tc]=arr.filter(Boolean).map(d=>({issue:d.issue, data:d.forecast}));
   }catch(e){ diskSnaps[tc]=[]; }
+}
+
+// localStorage(開いてる間に蓄積)とディスク(クラウド収集)を統合し、現発表を除いた過去スナップショット時系列を返す
+function mergedSnaps(num, curIssue){
+  const local=loadSnaps(num).map(s=>({issue:s.issue,data:s.data}));
+  const disk=(diskSnaps[num]||[]);
+  const map=new Map();
+  [...disk,...local].forEach(s=>{ try{ map.set(new Date(s.issue).toISOString(), s); }catch(e){} });
+  let curIso=null; try{ curIso=curIssue?new Date(curIssue).toISOString():null; }catch(e){}
+  return [...map.values()].filter(s=>{ try{return new Date(s.issue).toISOString()!==curIso;}catch(e){return true;} })
+    .sort((a,b)=>new Date(a.issue)-new Date(b.issue));
+}
+// 比較対象スナップショットを選ぶ。choice="auto"|"off"|ISO文字列
+function chooseCmpSnap(snaps, current, choice){
+  if(choice==="off"||!snaps.length) return null;
+  const nowMs=current.analysis?current.analysis.t.getTime():Date.now();
+  const age=s=>(nowMs-new Date(s.issue).getTime())/3600000;
+  if(choice && choice!=="auto"){
+    const s=snaps.find(x=>{try{return new Date(x.issue).toISOString()===choice;}catch(e){return false;}});
+    return s?{snap:s, ageH:age(s)}:null;
+  }
+  // auto: 約3時間前に最も近いもの（範囲内優先、無ければ一番古い）
+  let best=null;
+  for(const s of snaps){
+    const a=age(s); if(a<CMP_MIN_H||a>CMP_MAX_H+3) continue;
+    const sc=Math.abs(a-CMP_TARGET_H);
+    if(!best||sc<best.sc) best={snap:s, ageH:a, sc};
+  }
+  if(!best){ const s=snaps[0]; best={snap:s, ageH:age(s)}; }
+  return best;
+}
+// 比較セレクタを構築
+function buildCmpSelector(snaps, current){
+  const sel=document.getElementById("cmpSelect");
+  const nowMs=current.analysis?current.analysis.t.getTime():Date.now();
+  let html='<option value="auto">自動（約3時間前）</option>';
+  for(const s of [...snaps].reverse()){
+    const a=(nowMs-new Date(s.issue).getTime())/3600000;
+    const iso=new Date(s.issue).toISOString();
+    html+=`<option value="${iso}">${fmtJST(new Date(s.issue))} 発表（${a.toFixed(1)}h前）</option>`;
+  }
+  html+='<option value="off">重ねない</option>';
+  sel.innerHTML=html;
+  sel.value=cmpChoice;
+  if(sel.selectedIndex<0){ sel.value="auto"; cmpChoice="auto"; }
+}
+// 現在のfcと選択に基づき再描画（再取得なし）
+function redraw(){
+  const fc=window.__fc; if(!fc) return;
+  const chosen=chooseCmpSnap(window.__snaps||[], fc, cmpChoice);
+  window.__cmp = chosen ? {old:parseForecast(chosen.snap.data), info:chosen} : null;
+  render(fc); intensity(fc); speedTable(fc); compare(window.__tc, fc);
 }
 
 async function loadList(){
@@ -443,10 +518,9 @@ async function loadTC(tc){
   fc.spec = specRaw? parseSpec(specRaw) : {};
   saveSnap(tc, raw, fc.issue);
   await loadDiskSnaps(tc);
-  render(fc);
-  intensity(fc);
-  speedTable(fc);
-  compare(tc, fc);
+  window.__fc=fc; window.__tc=tc; window.__snaps=mergedSnaps(tc, fc.issue);
+  buildCmpSelector(window.__snaps, fc);
+  redraw();
   renderSnapList(tc);
   const cls=fc.spec&&fc.spec[0]?intLabel(fc.spec[0]):"";
   document.getElementById("issueMeta").innerHTML =
@@ -466,7 +540,8 @@ function nowJST(){ const d=new Date(); return `${pad(d.getMonth()+1)}/${pad(d.ge
 // ---------- イベント ----------
 document.getElementById("tcSelect").addEventListener("change",e=>loadTC(e.target.value).catch(err=>setStatus("エラー: "+err.message)));
 document.getElementById("refreshBtn").addEventListener("click",()=>loadList().catch(err=>setStatus("エラー: "+err.message)));
-document.getElementById("hrChk").addEventListener("change",()=>currentNum&&loadTC(currentNum));
+document.getElementById("hrChk").addEventListener("change",()=>redraw());
+document.getElementById("cmpSelect").addEventListener("change",e=>{ cmpChoice=e.target.value; redraw(); });
 document.getElementById("clearBtn").addEventListener("click",()=>{ if(currentNum&&confirm("この台風の蓄積履歴を消去しますか？")){ localStorage.removeItem(snapKey(currentNum)); renderSnapList(currentNum); document.getElementById("cmpBody").innerHTML='<span class="muted">履歴を消去しました。</span>'; }});
 function setupTimer(){ if(timer) clearInterval(timer); timer=setInterval(()=>{ if(document.getElementById("autoChk").checked) loadList().catch(()=>{}); }, REFRESH_MS); }
 
